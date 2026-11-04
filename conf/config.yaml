@@ -17,6 +17,12 @@ save_top_k: 10
 data_root:
 checkpoint:
 pretrained_weights:
+
+# named intentions (0 = original DeMo)
+num_intentions: 0
+intention_dir: data/intention_labels
+intention_weight: 0.5
+intention_class_weights:
 output: change_${datamodule.name}_${datamodule.phase}_${model.name}_${model.phase}
 
 # trainer
