@@ -26,10 +26,14 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import multiprocessing
+import os
 from collections import Counter, deque
+from functools import partial
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 from av2.datasets.motion_forecasting import scenario_serialization
 from av2.map.map_api import ArgoverseStaticMap
 
@@ -165,31 +169,39 @@ def label_agent(track, am: ArgoverseStaticMap, horizon: int = 60) -> tuple[int, 
     return CLASSES.index("STRAIGHT"), info
 
 
+def label_dir(d: Path, horizon: int = 60) -> list:
+    """One CSV row for the focal agent of the scenario folder d."""
+    sc = scenario_serialization.load_argoverse_scenario_parquet(d / f"scenario_{d.name}.parquet")
+    am = ArgoverseStaticMap.from_json(d / f"log_map_archive_{d.name}.json")
+    focal = next(t for t in sc.tracks if t.track_id == sc.focal_track_id)
+    lab, info = label_agent(focal, am, horizon)
+    return [sc.scenario_id, focal.track_id, focal.object_type.value, lab, CLASSES[lab],
+            info.get("disp_m"), info.get("dheading_deg"), info.get("reason", "")]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", required=True)
     ap.add_argument("--split", default="val")
     ap.add_argument("--out", default="intention_labels.csv")
     ap.add_argument("--horizon", type=int, default=60, help="future steps (10 Hz)")
+    ap.add_argument("--workers", type=int, default=os.cpu_count(), help="parallel processes")
     args = ap.parse_args()
 
     dirs = sorted(p for p in (Path(args.data_root) / args.split).iterdir() if p.is_dir())
-    counts = Counter()
+    work = partial(label_dir, horizon=args.horizon)
+    if args.workers > 1:
+        with multiprocessing.Pool(args.workers) as pool:
+            rows = list(tqdm(pool.imap(work, dirs, chunksize=16), total=len(dirs)))
+    else:
+        rows = [work(d) for d in tqdm(dirs)]
+    counts = Counter(r[4] for r in rows)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["scenario_id", "track_id", "object_type", "label", "label_name",
                     "disp_m", "dheading_deg", "note"])
-        for d in dirs:
-            sc = scenario_serialization.load_argoverse_scenario_parquet(
-                d / f"scenario_{d.name}.parquet")
-            am = ArgoverseStaticMap.from_json(d / f"log_map_archive_{d.name}.json")
-            focal = next(t for t in sc.tracks if t.track_id == sc.focal_track_id)
-            lab, info = label_agent(focal, am, args.horizon)
-            counts[CLASSES[lab]] += 1
-            w.writerow([sc.scenario_id, focal.track_id, focal.object_type.value, lab,
-                        CLASSES[lab], info.get("disp_m"), info.get("dheading_deg"),
-                        info.get("reason", "")])
+        w.writerows(rows)
     total = sum(counts.values())
     for c in CLASSES:
         print(f"{c:14s} {counts[c]:6d}  {100 * counts[c] / max(total, 1):5.1f}%")
