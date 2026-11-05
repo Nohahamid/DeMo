@@ -6,9 +6,26 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 
 from einops import rearrange, repeat
 
-from causal_conv1d import causal_conv1d_fn
-import causal_conv1d_cuda
-import selective_scan_cuda
+try:
+    from causal_conv1d import causal_conv1d_fn
+    import causal_conv1d_cuda
+except ImportError:  # pure-PyTorch fallback (slower, same maths)
+    causal_conv1d_cuda = None
+
+    def causal_conv1d_fn(x, weight, bias=None, activation=None):
+        """x: (b d l), weight: (d w). Depthwise causal conv, optional silu."""
+        width = weight.shape[-1]
+        out = F.conv1d(x, weight.unsqueeze(1).to(x.dtype),
+                       None if bias is None else bias.to(x.dtype),
+                       padding=width - 1, groups=x.shape[1])[..., :x.shape[-1]]
+        return F.silu(out) if activation in ("silu", "swish") else out
+
+try:
+    import selective_scan_cuda
+except ImportError:
+    selective_scan_cuda = None
+
+HAS_CUDA_KERNELS = selective_scan_cuda is not None and causal_conv1d_cuda is not None
 
 
 class SelectiveScanFn(torch.autograd.Function):
@@ -707,3 +724,40 @@ def bimamba_inner_ref(
     y_b = selective_scan_fn(x.flip([-1]), delta.flip([-1]), A_b, B.flip([-1]), C.flip([-1]), D, z.flip([-1]), delta_bias, delta_softplus=True)
     y = y + y_b.flip([-1])
     return F.linear(rearrange(y, "b d l -> b l d"), out_proj_weight, out_proj_bias)
+
+
+def mamba_inner_ref_no_out_proj(
+    xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
+    A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
+    C_proj_bias=None, delta_softplus=True
+):
+    """Same as MambaInnerFnNoOutProj, in plain PyTorch. Returns (b d l)."""
+    L = xz.shape[-1]
+    delta_rank = delta_proj_weight.shape[1]
+    d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
+    x, z = xz.chunk(2, dim=1)
+    x = causal_conv1d_fn(x, rearrange(conv1d_weight, "d 1 w -> d w"), conv1d_bias, "silu")
+    x_dbl = F.linear(rearrange(x, 'b d l -> (b l) d'), x_proj_weight)
+    delta = rearrange(delta_proj_weight @ x_dbl[:, :delta_rank].t(), "d (b l) -> b d l", l=L)
+    if B is None:
+        B = x_dbl[:, delta_rank:delta_rank + d_state]
+        if B_proj_bias is not None:
+            B = B + B_proj_bias.to(dtype=B.dtype)
+        B = rearrange(B, "(b l) dstate -> b dstate l", l=L).contiguous()
+    if C is None:
+        C = x_dbl[:, -d_state:]
+        if C_proj_bias is not None:
+            C = C + C_proj_bias.to(dtype=C.dtype)
+        C = rearrange(C, "(b l) dstate -> b dstate l", l=L).contiguous()
+    return selective_scan_ref(x, delta, A, B, C, D, z=z, delta_bias=delta_bias,
+                              delta_softplus=delta_softplus)
+
+
+if not HAS_CUDA_KERNELS:
+    # No compiled kernels (e.g. the CUDA build failed): use the reference code.
+    import warnings
+    warnings.warn("mamba_ssm: CUDA kernels not found, using the pure-PyTorch fallback (slower).")
+    selective_scan_fn = selective_scan_ref
+    mamba_inner_fn = mamba_inner_ref
+    bimamba_inner_fn = bimamba_inner_ref
+    mamba_inner_fn_no_out_proj = mamba_inner_ref_no_out_proj
