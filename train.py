@@ -10,7 +10,7 @@ from pytorch_lightning.callbacks import (
     RichModelSummary,
     RichProgressBar,
 )
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
@@ -18,7 +18,12 @@ def main(conf):
     pl.seed_everything(conf.seed, workers=True)
     output_dir = HydraConfig.get().runtime.output_dir
 
-    logger = TensorBoardLogger(save_dir=output_dir, name="logs")
+    try:  # TensorBoard can fail to import (e.g. Colab's TensorFlow needs numpy 2)
+        from torch.utils.tensorboard import SummaryWriter  # noqa: F401
+        logger = TensorBoardLogger(save_dir=output_dir, name="logs")
+    except Exception as e:
+        print(f"TensorBoard unavailable ({type(e).__name__}); logging to CSV instead")
+        logger = CSVLogger(save_dir=output_dir, name="logs")
 
     callbacks = [
         ModelCheckpoint(
