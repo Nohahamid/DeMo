@@ -82,6 +82,8 @@ def main():
         if sid in pred:
             p, conf = pred[sid]
             t += f"\npred {CLASSES[p]} ({conf:.2f})"
+        if info.get("off_path_m") is not None:
+            t += f"\nend {info['off_path_m']} m beside its own path"
         if info.get("reason"):
             t += f"\n{info['reason']}"
         ax.set_title(t, fontsize=8)

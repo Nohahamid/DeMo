@@ -47,7 +47,9 @@ STOP_DISP_M = 2.0        # under 2 m in 6 s ~ 0.33 m/s average
 LANE_MATCH_M = 2.5       # max distance from a lane centreline to count as "on" it
 LANE_HEADING_DEG = 60.0  # lane direction must roughly agree with the agent heading
 LATERAL_M = 1.75         # fallback: sideways offset that counts as a lane change
-GRAPH_DEPTH = 8          # successor hops searched for the end lane
+GRAPH_DEPTH = 20         # successor hops searched for the end lane
+MAX_LC_M = 8.0           # farther than ~2 lanes off the path is not a lane change
+STAY_M = 1.5             # end point this close to a lane it could reach by driving on = no lane change
 
 VEHICLE_TYPES = {"vehicle", "bus", "motorcyclist", "cyclist"}
 
@@ -115,6 +117,23 @@ def side_reachable(am: ArgoverseStaticMap, start: int, side: str) -> set[int]:
     return out
 
 
+def offset_from_lanes(am: ArgoverseStaticMap, xy: np.ndarray, lanes) -> tuple[float, float]:
+    """Distance from xy to the nearest centreline of the given lanes, and the
+    side: > 0 if xy lies left of that centreline (in its driving direction)."""
+    best, side = float("inf"), 0.0
+    for lid in lanes:
+        cl = am.get_lane_segment_centerline(lid)[:, :2]
+        a, b = cl[:-1], cl[1:]
+        ab = b - a
+        t = np.clip(((xy - a) * ab).sum(1) / np.maximum((ab * ab).sum(1), 1e-9), 0.0, 1.0)
+        q = a + t[:, None] * ab
+        d = np.linalg.norm(q - xy, axis=1)
+        i = int(d.argmin())
+        if d[i] < best:
+            best, side = float(d[i]), float(np.cross(ab[i], xy - q[i]))
+    return best, side
+
+
 def label_agent(track, am: ArgoverseStaticMap, horizon: int = 60) -> tuple[int, dict]:
     steps = {s.timestep: s for s in track.object_states}
     now, end = HIST_STEPS - 1, HIST_STEPS - 1 + horizon
@@ -151,12 +170,18 @@ def label_agent(track, am: ArgoverseStaticMap, horizon: int = 60) -> tuple[int, 
     nb = {am.get_lane_segment_left_neighbor_id(l0), am.get_lane_segment_right_neighbor_id(l0)}
     c0 = [l0] + [c for c in c0[1:] if c not in nb]
     ends = set(c1)
-    if any(ends & reachable(am, s) for s in c0):
+    ahead = set().union(*(reachable(am, s) for s in c0))
+    if ends & ahead:
         return CLASSES.index("STRAIGHT"), info
-    if any(ends & side_reachable(am, s, "L") for s in c0):
-        return CLASSES.index("LANE_CHANGE_L"), info
-    if any(ends & side_reachable(am, s, "R") for s in c0):
-        return CLASSES.index("LANE_CHANGE_R"), info
+    # Lane ids can disagree while the car physically stays on its path (split
+    # lanes, overlapping connectors), so decide by geometry: how far, and to
+    # which side, the end point is from every lane reachable by driving on.
+    off, side = offset_from_lanes(am, p1, ahead)
+    info.update(off_path_m=round(off, 2))
+    if off < STAY_M:
+        return CLASSES.index("STRAIGHT"), {**info, "reason": "on reachable path"}
+    if off < MAX_LC_M:
+        return CLASSES.index("LANE_CHANGE_L" if side > 0 else "LANE_CHANGE_R"), info
     # The graph has gaps (often inside intersections). Fall back on the sideways
     # offset of the end point relative to the starting heading.
     fwd = np.array([math.cos(h0), math.sin(h0)])
