@@ -113,7 +113,7 @@ class ModelForecast(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def load_from_checkpoint(self, ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location="cpu")["state_dict"]
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)["state_dict"]
         state_dict = {
             k[len("net.") :]: v for k, v in ckpt.items() if k.startswith("net.")
         }

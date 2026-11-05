@@ -57,7 +57,9 @@ def main(conf):
         print(model)  
         sys.stdout = original_stdout  
     datamodule = instantiate(conf.datamodule.target)
-    trainer.fit(model, datamodule, ckpt_path=conf.checkpoint)
+    import inspect
+    kw = {"weights_only": False} if "weights_only" in inspect.signature(trainer.fit).parameters else {}
+    trainer.fit(model, datamodule, ckpt_path=conf.checkpoint, **kw)
     trainer.validate(model, datamodule.val_dataloader())
 
 
