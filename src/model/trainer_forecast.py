@@ -27,9 +27,11 @@ class Trainer(pl.LightningModule):
         weight_decay: float = 1e-4,
         intention_weight: float = 0.5,
         intention_class_weights: list = None,
+        freeze_backbone: bool = False,
     ) -> None:
         super(Trainer, self).__init__()
         self.intention_weight = intention_weight
+        self.freeze_backbone = freeze_backbone
         self.warmup_epochs = warmup_epochs
         self.epochs = epochs
         self.lr = lr
@@ -44,6 +46,13 @@ class Trainer(pl.LightningModule):
         if pretrained_weights is not None:
             self.net.load_from_checkpoint(pretrained_weights)
             print('Pretrained weights have been loaded.')
+
+        if freeze_backbone:
+            # train only the intention heads; DeMo's trajectories stay exactly as released
+            for n, p in self.net.named_parameters():
+                p.requires_grad = 'intention_head' in n
+            n_train = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
+            print(f'Backbone frozen: training {n_train} intention-head parameters only.')
 
         metrics = MetricCollection(
             {
@@ -188,6 +197,8 @@ class Trainer(pl.LightningModule):
     def training_step(self, data, batch_idx):
         if isinstance(data, list):
             data = data[-1]
+        if self.freeze_backbone:
+            self.net.eval()  # no drop-path noise in the frozen backbone
         out = self(data)
         loss, loss_dict = self.cal_loss(out, data)
 

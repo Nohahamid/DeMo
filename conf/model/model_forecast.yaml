@@ -19,3 +19,4 @@ target:
   warmup_epochs: ${warmup_epochs}
   intention_weight: ${intention_weight}
   intention_class_weights: ${intention_class_weights}
+  freeze_backbone: ${freeze_backbone}
