@@ -16,3 +16,4 @@ target:
     sequence_origins: [50]
     radius: 150.0
     train_mode: 'only_focal'
+    intention_dir: ${intention_dir}

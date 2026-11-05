@@ -1,3 +1,4 @@
+import csv
 from typing import List
 from pathlib import Path
 import numpy as np
@@ -15,7 +16,7 @@ class Av2Dataset(Dataset):
         sequence_origins: List[int] = [50],
         radius: float = 150.0,
         train_mode: str = 'only_focal',
-
+        intention_dir: str = None,
     ):
         assert sequence_origins[-1] == 50 and num_historical_steps <= 50
         assert train_mode in ['only_focal', 'focal_and_scored']
@@ -29,6 +30,14 @@ class Av2Dataset(Dataset):
         self.sequence_origins = sequence_origins
         self.mode = 'only_focal' if split != 'train' else train_mode
         self.radius = radius
+
+        # scenario_id -> intention class, made by intention_labels.py
+        self.intentions = {}
+        label_file = Path(intention_dir) / f'{split}.csv' if intention_dir else None
+        if label_file is not None and label_file.exists():
+            with open(label_file) as f:
+                self.intentions = {r['scenario_id']: int(r['label']) for r in csv.DictReader(f)}
+            print(f'intention labels: {len(self.intentions)} from {label_file}')
 
         print(
             f'data root: {data_root}/{split}, total number of files: {len(self.file_list)}'
@@ -53,6 +62,10 @@ class Av2Dataset(Dataset):
         for cur_step in self.sequence_origins:
             for ag_idx in train_idx:
                 ag_dict = self.process_single_agent(data, ag_idx, cur_step)
+                label = -100  # ignored by the loss
+                if ag_idx == data['focal_idx']:
+                    label = self.intentions.get(data['scenario_id'], -100)
+                ag_dict['intention'] = torch.tensor(label, dtype=torch.long)
             sequence_data.append(ag_dict)
         
         return sequence_data
@@ -257,6 +270,9 @@ def collate_fn(seq_batch):
 
         data['x_key_valid_mask'] = data['x_valid_mask'].any(-1)
         data['lane_key_valid_mask'] = data['lane_valid_mask'].any(-1)
+
+        if 'intention' in batch[0]:
+            data['intention'] = torch.stack([b['intention'] for b in batch])
 
         data['scenario_id'] = [b['scenario_id'] for b in batch]
         data['track_id'] = [b['track_id'] for b in batch]

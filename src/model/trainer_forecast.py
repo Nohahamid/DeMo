@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchmetrics import MetricCollection
+from torchmetrics.classification import MulticlassAccuracy, MulticlassF1Score
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from src.metrics import MR, minADE, minFDE, brier_minFDE
 from src.utils.optim import WarmupCosLR
@@ -24,8 +25,13 @@ class Trainer(pl.LightningModule):
         warmup_epochs: int = 10,
         epochs: int = 60,
         weight_decay: float = 1e-4,
+        intention_weight: float = 0.5,
+        intention_class_weights: list = None,
+        freeze_backbone: bool = False,
     ) -> None:
         super(Trainer, self).__init__()
+        self.intention_weight = intention_weight
+        self.freeze_backbone = freeze_backbone
         self.warmup_epochs = warmup_epochs
         self.epochs = epochs
         self.lr = lr
@@ -41,6 +47,13 @@ class Trainer(pl.LightningModule):
             self.net.load_from_checkpoint(pretrained_weights)
             print('Pretrained weights have been loaded.')
 
+        if freeze_backbone:
+            # train only the intention heads; DeMo's trajectories stay exactly as released
+            for n, p in self.net.named_parameters():
+                p.requires_grad = 'intention_head' in n
+            n_train = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
+            print(f'Backbone frozen: training {n_train} intention-head parameters only.')
+
         metrics = MetricCollection(
             {
                 "minADE1": minADE(k=1),
@@ -54,6 +67,15 @@ class Trainer(pl.LightningModule):
         self.laplace_loss = LaplaceNLLLoss()
         self.val_metrics = metrics.clone(prefix="val_")
         self.val_metrics_new = metrics.clone(prefix="val_new_")
+
+        num_intentions = model.get('num_intentions', 0)
+        if num_intentions > 0:
+            # class weights counter the imbalance (most agents go straight)
+            w = torch.tensor(intention_class_weights, dtype=torch.float) \
+                if intention_class_weights is not None else torch.ones(num_intentions)
+            self.register_buffer('intention_class_weights', w)
+            self.val_intent_acc = MulticlassAccuracy(num_classes=num_intentions, average='micro')
+            self.val_intent_f1 = MulticlassF1Score(num_classes=num_intentions, average='macro')
     
     def get_model(self, model_type):
         model_dict = {
@@ -141,6 +163,18 @@ class Trainer(pl.LightningModule):
                 new_agent_reg_loss + dense_reg_loss + new_pi_reg_loss
         loss = loss + laplace_loss + laplace_loss_new
 
+        # intention loss: the agent's intention, and the intention of the
+        # mode closest to the ground truth (that mode should carry the name)
+        intent_loss = None
+        if "intent_logits" in out and "intention" in data:
+            label = data["intention"]
+            if (label >= 0).any():
+                w = self.intention_class_weights
+                intent_loss = F.cross_entropy(out["intent_logits"], label, weight=w, ignore_index=-100)
+                mode_logits = out["mode_intent_logits"][torch.arange(label.shape[0]), best_mode]
+                intent_loss = intent_loss + F.cross_entropy(mode_logits, label, weight=w, ignore_index=-100)
+                loss = loss + self.intention_weight * intent_loss
+
         disp_dict = {
             f"{tag}loss": loss.item(),
             f"{tag}reg_loss": agent_reg_loss.item(),
@@ -155,12 +189,16 @@ class Trainer(pl.LightningModule):
             disp_dict[f"{tag}reg_loss_new_pi"] = new_pi_reg_loss.item()
         if dense_predict is not None:
             disp_dict[f"{tag}reg_loss_dense"] = dense_reg_loss.item()
+        if intent_loss is not None:
+            disp_dict[f"{tag}intent_loss"] = intent_loss.item()
 
         return loss, disp_dict
 
     def training_step(self, data, batch_idx):
         if isinstance(data, list):
             data = data[-1]
+        if self.freeze_backbone:
+            self.net.eval()  # no drop-path noise in the frozen backbone
         out = self(data)
         loss, loss_dict = self.cal_loss(out, data)
 
@@ -187,6 +225,15 @@ class Trainer(pl.LightningModule):
             out['pi'] = out['new_pi']
         if out['new_y_hat'] is not None:
             metrics_new = self.val_metrics_new(out, data['target'][:, 0])
+
+        if "intent_logits" in out and "intention" in data:
+            valid = data["intention"] >= 0
+            if valid.any():
+                pred = out["intent_logits"][valid].argmax(-1)
+                self.val_intent_acc.update(pred, data["intention"][valid])
+                self.val_intent_f1.update(pred, data["intention"][valid])
+                self.log("val_intent_acc", self.val_intent_acc, on_step=False, on_epoch=True)
+                self.log("val_intent_f1", self.val_intent_f1, on_step=False, on_epoch=True)
 
         self.log_dict(
             metrics,

@@ -11,7 +11,14 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import Tensor
 from torch.profiler import ProfilerActivity, profile, record_function
-from transformers.generation import GreedySearchDecoderOnlyOutput, SampleDecoderOnlyOutput
+try:
+    from transformers.generation import GreedySearchDecoderOnlyOutput, SampleDecoderOnlyOutput
+except ImportError:  # renamed in newer transformers, or transformers missing (only text generation uses these)
+    try:
+        from transformers.generation import GenerateDecoderOnlyOutput as GreedySearchDecoderOnlyOutput
+        SampleDecoderOnlyOutput = GreedySearchDecoderOnlyOutput
+    except ImportError:
+        GreedySearchDecoderOnlyOutput = SampleDecoderOnlyOutput = None
 
 
 @dataclass
