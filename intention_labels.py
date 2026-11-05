@@ -52,9 +52,11 @@ def wrap_deg(a: float) -> float:
     return (a + 180.0) % 360.0 - 180.0
 
 
-def lane_match(am: ArgoverseStaticMap, xy: np.ndarray, heading: float):
-    """Lane id whose centreline is closest to xy and points roughly the same way."""
-    best, best_d = None, LANE_MATCH_M
+def lane_candidates(am: ArgoverseStaticMap, xy: np.ndarray, heading: float) -> list[int]:
+    """Lanes whose centreline is within LANE_MATCH_M of xy and points roughly the
+    same way, closest first. At an intersection entrance several lanes overlap
+    (straight and turn connectors), so all of them are kept."""
+    out = []
     for seg in am.get_nearby_lane_segments(xy, 10.0):
         cl = am.get_lane_segment_centerline(seg.id)[:, :2]
         a, b = cl[:-1], cl[1:]
@@ -66,9 +68,15 @@ def lane_match(am: ArgoverseStaticMap, xy: np.ndarray, heading: float):
         lane_dir = math.degrees(math.atan2(ab[i, 1], ab[i, 0]))
         if abs(wrap_deg(lane_dir - math.degrees(heading))) > LANE_HEADING_DEG:
             continue
-        if d[i] < best_d:
-            best, best_d = seg.id, d[i]
-    return best
+        if d[i] < LANE_MATCH_M:
+            out.append((float(d[i]), seg.id))
+    return [lid for _, lid in sorted(out)]
+
+
+def lane_match(am: ArgoverseStaticMap, xy: np.ndarray, heading: float):
+    """Closest lane that points roughly the same way, or None."""
+    c = lane_candidates(am, xy, heading)
+    return c[0] if c else None
 
 
 def reachable(am: ArgoverseStaticMap, start: int, depth: int = GRAPH_DEPTH) -> set[int]:
@@ -127,15 +135,23 @@ def label_agent(track, am: ArgoverseStaticMap, horizon: int = 60) -> tuple[int, 
     if dh < -TURN_DEG:
         return CLASSES.index("RIGHT_TURN"), info
 
-    l0, l1 = lane_match(am, p0, h0), lane_match(am, p1, h1)
+    c0, c1 = lane_candidates(am, p0, h0), lane_candidates(am, p1, h1)
+    l0, l1 = (c0[0] if c0 else None), (c1[0] if c1 else None)
     info.update(lane_start=l0, lane_end=l1)
     if l0 is None or l1 is None:
         return CLASSES.index("OTHER"), {**info, "reason": "no lane match"}
-    if l1 in reachable(am, l0):
+    # Any overlapping start lane may be the real one (e.g. the straight connector
+    # next to a turn connector), so check them all; straight wins.
+    # ...but not the lanes beside it: a car already drifting over the line
+    # would otherwise make a real lane change look straight.
+    nb = {am.get_lane_segment_left_neighbor_id(l0), am.get_lane_segment_right_neighbor_id(l0)}
+    c0 = [l0] + [c for c in c0[1:] if c not in nb]
+    ends = set(c1)
+    if any(ends & reachable(am, s) for s in c0):
         return CLASSES.index("STRAIGHT"), info
-    if l1 in side_reachable(am, l0, "L"):
+    if any(ends & side_reachable(am, s, "L") for s in c0):
         return CLASSES.index("LANE_CHANGE_L"), info
-    if l1 in side_reachable(am, l0, "R"):
+    if any(ends & side_reachable(am, s, "R") for s in c0):
         return CLASSES.index("LANE_CHANGE_R"), info
     # The graph has gaps (often inside intersections). Fall back on the sideways
     # offset of the end point relative to the starting heading.
