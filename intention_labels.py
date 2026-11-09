@@ -143,13 +143,25 @@ def label_agent(track, am: ArgoverseStaticMap, horizon: int = 60) -> tuple[int, 
 
     p0, p1 = np.array(steps[now].position), np.array(steps[end].position)
     h0, h1 = steps[now].heading, steps[end].heading
+    return label_states(am, p0, h0, p1, h1, track.object_type.value)
+
+
+def label_states(am: ArgoverseStaticMap, p0, h0: float, p1, h1: float, object_type: str) -> tuple[int, dict]:
+    """Label a move from (p0, h0) now to (p1, h1) at the end of the horizon.
+
+    Same rules for the true future (label_agent) and for a predicted path
+    (the rule-on-DeMo baseline in analyze_intentions.py). Positions in the
+    map frame, headings in radians.
+    """
+    info = {}
+    p0, p1 = np.asarray(p0, dtype=float), np.asarray(p1, dtype=float)
     disp = float(np.linalg.norm(p1 - p0))
     dh = wrap_deg(math.degrees(h1 - h0))
     info.update(disp_m=round(disp, 2), dheading_deg=round(dh, 1))
 
     if disp < STOP_DISP_M:
         return CLASSES.index("STOP"), info
-    if track.object_type.value not in VEHICLE_TYPES:
+    if object_type not in VEHICLE_TYPES:
         return CLASSES.index("OTHER"), {**info, "reason": "not a vehicle-like agent"}
     if abs(dh) > UTURN_DEG:
         return CLASSES.index("U_TURN"), info

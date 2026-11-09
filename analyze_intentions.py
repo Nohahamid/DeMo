@@ -9,6 +9,8 @@ Prints, on the validation set:
   2. the confusion matrix (rows = true label, columns = predicted)
   3. results per agent type (vehicle, pedestrian, ...)
   4. whether the best-matching mode is given the right name
+  5. (with --raw_root) a baseline without any training: the same label rules
+     applied to DeMo's most likely predicted path, compared class by class
 and writes one row per scenario to <checkpoint folder>/../analysis_val.csv.
 """
 import argparse
@@ -16,12 +18,13 @@ import csv
 import glob
 import os
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from intention_labels import CLASSES
+from intention_labels import CLASSES, label_states
 from src.datamodule.av2_dataset import Av2Dataset, collate_fn
 from src.model.model_forecast import ModelForecast
 
@@ -41,6 +44,8 @@ def main():
     ap.add_argument("--data_root", default="data/DeMo_processed")
     ap.add_argument("--intention_dir", default="data/intention_labels")
     ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--raw_root", default=None,
+                    help="raw AV2 folder holding val/<id>/ (needed for the rule-on-DeMo baseline)")
     args = ap.parse_args()
     ckpt = args.ckpt or newest_ckpt()
     print("checkpoint:", ckpt)
@@ -74,6 +79,12 @@ def main():
             best = fde.argmin(-1)
             prob = out["intent_logits"].softmax(-1)
             mode_pred = out["mode_intent_logits"].argmax(-1)            # [B, K]
+            pi = out["new_pi"] if out.get("new_pi") is not None else out["pi"]
+            top = y[torch.arange(y.shape[0]), pi.argmax(-1)]            # [B, 60, 2], agent frame
+            th = data["theta"].double()
+            rot = torch.stack([torch.stack([th.cos(), -th.sin()], -1),
+                               torch.stack([th.sin(), th.cos()], -1)], -2)  # [B, 2, 2]
+            world = (top.double() @ rot.transpose(1, 2) + data["origin"].double()[:, None]).cpu().numpy()
             for i, sid in enumerate(data["scenario_id"]):
                 rows.append(dict(
                     scenario_id=sid, object_type=types.get(sid, "?"),
@@ -81,7 +92,23 @@ def main():
                     conf=float(prob[i].max()),
                     best_mode_name=int(mode_pred[i, best[i]]),
                     minFDE6=float(fde[i].min()), minADE6=float(ade[i].min()),
+                    _p0=data["origin"][i].double().cpu().numpy(), _h0=float(data["theta"][i]),
+                    _path=world[i],
                 ))
+
+    if args.raw_root:
+        from av2.map.map_api import ArgoverseStaticMap
+        for r in rows:
+            sid = r["scenario_id"]
+            am = ArgoverseStaticMap.from_json(
+                Path(args.raw_root) / "val" / sid / f"log_map_archive_{sid}.json")
+            path = r["_path"]
+            d = path[-1] - path[-6]                                     # last 0.5 s
+            h1 = float(np.arctan2(d[1], d[0])) if np.linalg.norm(d) > 0.2 else r["_h0"]
+            r["rule_pred"] = label_states(am, r["_p0"], r["_h0"], path[-1], h1, r["object_type"])[0]
+    for r in rows:
+        for k in ("_p0", "_h0", "_path"):
+            r.pop(k)
 
     lab = np.array([r["label"] for r in rows])
     pred = np.array([r["pred"] for r in rows])
@@ -127,6 +154,24 @@ def main():
 
     bm = np.array([r["best_mode_name"] for r in rows])
     print(f"\n4. Best-matching mode carries the right name: {(bm[ok] == lab[ok]).mean():.3f}")
+
+    if args.raw_root:
+        rp = np.array([r["rule_pred"] for r in rows])
+        print("\n5. Baseline: label rules on DeMo's most likely path (no training) vs our heads")
+        print(f"{'class':14s} {'n':>5s} {'F1 rule':>8s} {'F1 ours':>8s}")
+        fr, fo = [], []
+        for c, name in enumerate(CLASSES):
+            n = int((lab == c).sum())
+            def f1(pr):
+                tp = int(((pr == c) & (lab == c)).sum())
+                p = tp / max(int(((pr == c) & ok).sum()), 1); r_ = tp / max(n, 1)
+                return 2 * p * r_ / max(p + r_, 1e-9)
+            a, b = f1(rp), f1(pred)
+            if n:
+                fr.append(a); fo.append(b)
+            print(f"{name:14s} {n:5d} {a:8.2f} {b:8.2f}")
+        print(f"macro F1 (classes in val): rule {np.mean(fr):.3f}   ours {np.mean(fo):.3f}")
+        print(f"accuracy:                  rule {(rp[ok] == lab[ok]).mean():.3f}   ours {(pred[ok] == lab[ok]).mean():.3f}")
 
     out_csv = os.path.join(os.path.dirname(os.path.dirname(ckpt)), "analysis_val.csv")
     with open(out_csv, "w", newline="") as f:
