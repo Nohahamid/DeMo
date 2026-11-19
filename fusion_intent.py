@@ -183,9 +183,14 @@ def diagnose(args):
     cond = np.where(right, fde, np.inf).min(1)                     # best right-maneuver path
     miss = args.miss
 
-    print(f"{n_all} val scenarios, miss = final error > {miss} m\n")
+    print(f"{n_all} val scenarios, miss = final error > {miss} m")
+    mfde = fde.min(1)
+    div = np.array([len(set(r)) for r in rule])                     # distinct maneuvers among the 6 paths
+    print(f"overall: minFDE6 {mfde.mean():.3f} m, minADE6 {z['ade'].min(1).mean():.3f} m, "
+          f"MR6 {(mfde > miss).mean():.1%}, semantic diversity@6 {div.mean():.2f} distinct maneuvers"
+          f" (vehicles {div[np.isin(z['otype'], list(VEHICLE_TYPES))].mean():.2f})\n")
     print("1. Per true maneuver (A + B + C + OK = 100%)")
-    hdr = (f"{'maneuver':14s} {'n':>5s} {'Cov@6':>6s} {'Top1':>6s} {'minFDE6':>8s} {'condFDE':>8s} {'topFDE':>7s}"
+    hdr = (f"{'maneuver':14s} {'n':>5s} {'Cov@6':>6s} {'Top1':>6s} {'minFDE6':>8s} {'MR6':>6s} {'div6':>5s} {'condFDE':>8s} {'topFDE':>7s}"
            f" {'A gen':>6s} {'B rank':>6s} {'C geom':>6s} {'OK':>6s}")
     print(hdr)
     rows = []
@@ -200,14 +205,16 @@ def diagnose(args):
         ok = top_ok[m] & (top_fde[m] <= miss)
         cf = cond[m][cover[m]]
         r = dict(maneuver=CLASSES[c], n=n, cov6=cover[m].mean(), top1=top_ok[m].mean(),
+                 MR6=(fde[m].min(1) > miss).mean(), div6=div[m].mean(),
                  minFDE6=fde[m].min(1).mean(), condFDE=cf.mean() if len(cf) else np.nan,
                  topFDE=top_fde[m][top_ok[m]].mean() if top_ok[m].any() else np.nan,
                  A=a.mean(), B=b.mean(), C=cc.mean(), OK=ok.mean())
         rows.append(r)
-        print(f"{r['maneuver']:14s} {n:5d} {r['cov6']:6.1%} {r['top1']:6.1%} {r['minFDE6']:8.2f} "
+        print(f"{r['maneuver']:14s} {n:5d} {r['cov6']:6.1%} {r['top1']:6.1%} {r['minFDE6']:8.2f} {r['MR6']:6.1%} {r['div6']:5.2f} "
               f"{r['condFDE']:8.2f} {r['topFDE']:7.2f} {r['A']:6.1%} {r['B']:6.1%} {r['C']:6.1%} {r['OK']:6.1%}")
     print("  Cov@6   = any of the 6 paths has the true maneuver")
     print("  Top1    = the highest-scored path has the true maneuver")
+    print("  MR6     = share with all 6 paths ending > miss m away; div6 = distinct maneuvers among the 6 paths")
     print("  condFDE = final error of the best right-maneuver path (scenarios where one exists)")
     print("  topFDE  = final error of the top path when it has the right maneuver")
     print("  A = no right path (mode generation), B = right path exists but not top (ranking),")
