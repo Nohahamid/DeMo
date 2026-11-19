@@ -2,8 +2,11 @@ import json
 
 import torch
 
-from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
-from transformers.utils.hub import cached_file
+try:
+    from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
+    from transformers.utils.hub import cached_file
+except ImportError:  # only needed to load HF checkpoints, not used by DeMo
+    WEIGHTS_NAME, CONFIG_NAME, cached_file = "pytorch_model.bin", "config.json", None
 
 
 def load_config_hf(model_name):

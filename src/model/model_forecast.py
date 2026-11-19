@@ -24,8 +24,12 @@ class ModelForecast(nn.Module):
         qkv_bias=False,
         drop_path=0.2,
         future_steps: int = 60,
+        num_intentions: int = 0,
+        semantic_slots: bool = False,
     ) -> None:
         super().__init__()
+        self.num_intentions = num_intentions
+        self.semantic_slots = semantic_slots
 
         self.hist_embed_mlp = nn.Sequential(
             nn.Linear(4, 64),
@@ -83,7 +87,21 @@ class ModelForecast(nn.Module):
 
         self.time_decoder = TimeDecoder()
 
+        # Named intentions: one prediction for the agent (from its scene
+        # token) and one per mode query, so each of the K modes gets a name.
+        if num_intentions > 0:
+            self.intention_head = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, num_intentions)
+            )
+            self.mode_intention_head = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, num_intentions)
+            )
+
         self.initialize_weights()
+        if semantic_slots:
+            # added after the weight init: they start at zero, so the model
+            # starts exactly as the released DeMo
+            self.time_decoder.enable_semantic_slots(embed_dim)
 
     def initialize_weights(self):
         nn.init.normal_(self.actor_type_embed, std=0.02)
@@ -101,7 +119,7 @@ class ModelForecast(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def load_from_checkpoint(self, ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location="cpu")["state_dict"]
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)["state_dict"]
         state_dict = {
             k[len("net.") :]: v for k, v in ckpt.items() if k.startswith("net.")
         }
@@ -227,7 +245,9 @@ class ModelForecast(nn.Module):
 
         # decoder module with decoupled queries
         dense_predict, y_hat, pi, x_mode, new_y_hat, new_pi, mode_dense, scal, scal_new = \
-        self.time_decoder(mode, x_encoder, mask=~key_valid_mask)
+        self.time_decoder(mode, x_encoder, mask=~key_valid_mask,
+                          slot_sem=data.get("slot_sem") if self.semantic_slots else None,
+                          slot_anchor=data.get("slot_anchor") if self.semantic_slots else None)
 
         if isinstance(self, StreamModelForecast) and self.use_stream_decoder:
             cos, sin = data["theta"].cos(), data["theta"].sin()
@@ -270,6 +290,10 @@ class ModelForecast(nn.Module):
             "new_pi": new_pi,  # final probability output     
             "scal_new": scal_new,  # final output for Laplace loss
         }
+
+        if self.num_intentions > 0:
+            ret_dict["intent_logits"] = self.intention_head(x_encoder[:, 0])  # [B, C]
+            ret_dict["mode_intent_logits"] = self.mode_intention_head(x_mode)  # [B, K, C]
 
         if isinstance(self, StreamModelForecast):
             glo_y_hat = torch.bmm(
