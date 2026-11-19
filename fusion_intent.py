@@ -10,12 +10,18 @@ learns on top of it, with DeMo frozen:
   fit      train a small classifier (gradient-boosted trees) on the train
            features and compare it on val with the rule, the probability-
            weighted rule over all 6 paths, and the heads
+  diagnose per true maneuver, split DeMo's failures into
+           A no path has the right maneuver      (mode generation)
+           B a right path exists but ranks low   (ranking / calibration)
+           C the right path is top but is far off (geometry / refinement)
+           and show which maneuver each of the 6 mode queries stands for
 
 Usage
   python fusion_intent.py extract --ckpt CKPT --data_root PROCESSED --raw_root RAW \
       --intention_dir LABELS --split train --out fusion_train.npz
   python fusion_intent.py extract ... --split val --out fusion_val.npz
   python fusion_intent.py fit --train fusion_train.npz --val fusion_val.npz
+  python fusion_intent.py diagnose --val fusion_val.npz
 """
 import argparse
 import csv
@@ -25,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-from intention_labels import CLASSES, label_states
+from intention_labels import CLASSES, VEHICLE_TYPES, label_states
 
 C = len(CLASSES)
 TYPES = ["vehicle", "bus", "motorcyclist", "cyclist", "pedestrian"]
@@ -67,7 +73,7 @@ def extract(args):
         for r in csv.DictReader(f):
             types[r["scenario_id"]] = r["object_type"]
 
-    sids, labels, pis, heads, jobs = [], [], [], [], []
+    sids, labels, pis, heads, jobs, fdes, ades = [], [], [], [], [], [], []
     from tqdm.auto import tqdm
     with torch.no_grad():
         for batch in tqdm(dl, desc="DeMo"):
@@ -82,12 +88,16 @@ def extract(args):
             world = (y.double() @ rot[:, None].transpose(-1, -2)
                      + data["origin"].double()[:, None, None]).cpu().numpy()          # [B, K, 60, 2]
             hp = out["intent_logits"].softmax(-1).cpu().numpy()
+            gt = data["target"][:, 0]                                                   # [B, 60, 2], agent frame
+            fde = (y[:, :, -1] - gt[:, None, -1]).norm(dim=-1).cpu().numpy()           # [B, K]
+            ade = (y - gt[:, None]).norm(dim=-1).mean(-1).cpu().numpy()                # [B, K]
             for i, sid in enumerate(data["scenario_id"]):
                 lab = int(data["intention"][i])
                 if lab < 0:
                     continue
                 sids.append(sid); labels.append(lab)
                 pis.append(pi[i].cpu().numpy()); heads.append(hp[i])
+                fdes.append(fde[i]); ades.append(ade[i])
                 jobs.append((sid, args.raw_root, args.split, data["origin"][i].double().cpu().numpy(),
                              float(data["theta"][i]), world[i], types.get(sid, "vehicle")))
 
@@ -98,6 +108,7 @@ def extract(args):
         pi=np.array(pis, dtype=np.float32), heads=np.array(heads, dtype=np.float32),
         rule=np.array([[p[0] for p in pp] for pp in per_path], dtype=np.int64),
         geom=np.array([[p[1:] for p in pp] for pp in per_path], dtype=np.float32),
+        fde=np.array(fdes, dtype=np.float32), ade=np.array(ades, dtype=np.float32),
         otype=np.array([types.get(s, "vehicle") for s in sids]))
     print(f"saved {len(sids)} scenarios to {args.out}")
 
@@ -156,6 +167,74 @@ def fit(args):
                         **{k.replace(" ", "_"): v for k, v in preds.items()})
 
 
+def diagnose(args):
+    """Where does DeMo fail on each maneuver? Paths stay in DeMo's mode order (mode k = query k)."""
+    z = np.load(args.val)
+    if "fde" not in z:
+        raise SystemExit("this npz has no path errors: run extract again with the current fusion_intent.py")
+    lab, rule, pi, fde = z["label"], z["rule"], z["pi"], z["fde"]
+    n_all = len(lab)
+    top = pi.argmax(1)
+    ar = np.arange(n_all)
+    right = rule == lab[:, None]                                   # [N, 6] path k has the true maneuver
+    cover = right.any(1)
+    top_ok = right[ar, top]
+    top_fde = fde[ar, top]
+    cond = np.where(right, fde, np.inf).min(1)                     # best right-maneuver path
+    miss = args.miss
+
+    print(f"{n_all} val scenarios, miss = final error > {miss} m\n")
+    print("1. Per true maneuver (A + B + C + OK = 100%)")
+    hdr = (f"{'maneuver':14s} {'n':>5s} {'Cov@6':>6s} {'Top1':>6s} {'minFDE6':>8s} {'condFDE':>8s} {'topFDE':>7s}"
+           f" {'A gen':>6s} {'B rank':>6s} {'C geom':>6s} {'OK':>6s}")
+    print(hdr)
+    rows = []
+    for c in range(C):
+        m = lab == c
+        n = int(m.sum())
+        if n == 0:
+            continue
+        a = ~cover[m]                                              # no right path
+        b = cover[m] & ~top_ok[m]                                  # right path exists, not top
+        cc = top_ok[m] & (top_fde[m] > miss)                       # top is right, but far off
+        ok = top_ok[m] & (top_fde[m] <= miss)
+        cf = cond[m][cover[m]]
+        r = dict(maneuver=CLASSES[c], n=n, cov6=cover[m].mean(), top1=top_ok[m].mean(),
+                 minFDE6=fde[m].min(1).mean(), condFDE=cf.mean() if len(cf) else np.nan,
+                 topFDE=top_fde[m][top_ok[m]].mean() if top_ok[m].any() else np.nan,
+                 A=a.mean(), B=b.mean(), C=cc.mean(), OK=ok.mean())
+        rows.append(r)
+        print(f"{r['maneuver']:14s} {n:5d} {r['cov6']:6.1%} {r['top1']:6.1%} {r['minFDE6']:8.2f} "
+              f"{r['condFDE']:8.2f} {r['topFDE']:7.2f} {r['A']:6.1%} {r['B']:6.1%} {r['C']:6.1%} {r['OK']:6.1%}")
+    print("  Cov@6   = any of the 6 paths has the true maneuver")
+    print("  Top1    = the highest-scored path has the true maneuver")
+    print("  condFDE = final error of the best right-maneuver path (scenarios where one exists)")
+    print("  topFDE  = final error of the top path when it has the right maneuver")
+    print("  A = no right path (mode generation), B = right path exists but not top (ranking),")
+    print(f"  C = top path right but final error > {miss} m (geometry / refinement)")
+
+    print("\n2. What each mode query stands for (share of scenarios, rows = query)")
+    short = ["STR", "LEFT", "RIGHT", "LC_L", "LC_R", "UTRN", "STOP", "OTH"]
+    print(f"{'query':6s}" + "".join(f"{s:>7s}" for s in short) + f"{'purity':>8s}{'is top':>8s}")
+    veh = np.isin(z["otype"], list(VEHICLE_TYPES))
+    for k in range(rule.shape[1]):
+        d = np.bincount(rule[veh, k], minlength=C) / max(int(veh.sum()), 1)
+        print(f"#{k:<5d}" + "".join(f"{v:7.1%}" for v in d) + f"{d.max():8.1%}{(top == k).mean():8.1%}")
+    print("  purity = share of the most common maneuver for that query (vehicle-like agents only);")
+    print("  a query that always means the same maneuver has high purity")
+    print("\n   Same, only for scenarios whose true maneuver is a turn or lane change:")
+    sel = veh & np.isin(lab, [1, 2, 3, 4])
+    for k in range(rule.shape[1]):
+        d = np.bincount(rule[sel, k], minlength=C) / max(int(sel.sum()), 1)
+        print(f"#{k:<5d}" + "".join(f"{v:7.1%}" for v in d) + f"{d.max():8.1%}{(top[sel] == k).mean():8.1%}")
+
+    out = args.val.replace(".npz", "_diagnosis.csv")
+    with open(out, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader(); w.writerows(rows)
+    print("\nsaved", out)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -171,8 +250,11 @@ def main():
     f = sub.add_parser("fit")
     f.add_argument("--train", required=True)
     f.add_argument("--val", required=True)
+    d = sub.add_parser("diagnose")
+    d.add_argument("--val", required=True)
+    d.add_argument("--miss", type=float, default=2.0, help="final error (m) above which a path is a miss")
     args = ap.parse_args()
-    extract(args) if args.cmd == "extract" else fit(args)
+    {"extract": extract, "fit": fit, "diagnose": diagnose}[args.cmd](args)
 
 
 if __name__ == "__main__":
