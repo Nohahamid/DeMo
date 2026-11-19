@@ -28,8 +28,15 @@ class Trainer(pl.LightningModule):
         intention_weight: float = 0.5,
         intention_class_weights: list = None,
         freeze_backbone: bool = False,
+        train_scope: str = 'all',
+        semantic_weight: float = 1.0,
     ) -> None:
         super(Trainer, self).__init__()
+        assert train_scope in ('all', 'heads', 'decoder')
+        if freeze_backbone:
+            train_scope = 'heads'
+        self.train_scope = train_scope
+        self.semantic_weight = semantic_weight
         self.intention_weight = intention_weight
         self.freeze_backbone = freeze_backbone
         self.warmup_epochs = warmup_epochs
@@ -47,12 +54,15 @@ class Trainer(pl.LightningModule):
             self.net.load_from_checkpoint(pretrained_weights)
             print('Pretrained weights have been loaded.')
 
-        if freeze_backbone:
-            # train only the intention heads; DeMo's trajectories stay exactly as released
+        if train_scope != 'all':
+            # 'heads': only the intention heads, DeMo's trajectories stay exactly as released
+            # 'decoder': DeMo's encoders stay frozen; the decoder (with the semantic
+            #            slots) and the intention heads are trained
+            keep = ('intention_head',) if train_scope == 'heads' else ('intention_head', 'time_decoder.')
             for n, p in self.net.named_parameters():
-                p.requires_grad = 'intention_head' in n
+                p.requires_grad = any(k in n for k in keep)
             n_train = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
-            print(f'Backbone frozen: training {n_train} intention-head parameters only.')
+            print(f'train_scope={train_scope}: training {n_train} parameters only.')
 
         metrics = MetricCollection(
             {
@@ -163,6 +173,19 @@ class Trainer(pl.LightningModule):
                 new_agent_reg_loss + dense_reg_loss + new_pi_reg_loss
         loss = loss + laplace_loss + laplace_loss_new
 
+        # semantic slots: the query that stands for the true maneuver must fit
+        # the true path (this is what teaches a query what "lane change" means)
+        sem_loss = None
+        if "slot_target" in data and getattr(self.net, "semantic_slots", False):
+            tgt = data["slot_target"]
+            sel = tgt >= 0
+            if sel.any():
+                idx = torch.arange(tgt.shape[0], device=tgt.device)[sel]
+                sem_loss = F.smooth_l1_loss(y_hat[idx, tgt[sel]], y[sel])
+                if new_y_hat is not None:
+                    sem_loss = sem_loss + F.smooth_l1_loss(new_y_hat[idx, tgt[sel]], y[sel])
+                loss = loss + self.semantic_weight * sem_loss
+
         # intention loss: the agent's intention, and the intention of the
         # mode closest to the ground truth (that mode should carry the name)
         intent_loss = None
@@ -191,14 +214,19 @@ class Trainer(pl.LightningModule):
             disp_dict[f"{tag}reg_loss_dense"] = dense_reg_loss.item()
         if intent_loss is not None:
             disp_dict[f"{tag}intent_loss"] = intent_loss.item()
+        if sem_loss is not None:
+            disp_dict[f"{tag}semantic_loss"] = sem_loss.item()
 
         return loss, disp_dict
 
     def training_step(self, data, batch_idx):
         if isinstance(data, list):
             data = data[-1]
-        if self.freeze_backbone:
+        if self.train_scope == 'heads':
             self.net.eval()  # no drop-path noise in the frozen backbone
+        elif self.train_scope == 'decoder':
+            self.net.eval()
+            self.net.time_decoder.train()
         out = self(data)
         loss, loss_dict = self.cal_loss(out, data)
 

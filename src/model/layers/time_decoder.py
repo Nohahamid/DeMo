@@ -167,7 +167,19 @@ class TimeDecoder(nn.Module):
         # MLP for final output
         self.predictor_dense = GMMPredictor_dense(future_len)
 
-    def forward(self, mode, encoding, mask=None):
+    def enable_semantic_slots(self, dim=128, num_semantics=6, anchor_scale=50.0):
+        """Give each mode query a meaning: a learned embedding per maneuver
+        (+1 for a FREE query) and an embedding of the maneuver's map anchor.
+        Both start at zero, so the decoder starts as the released DeMo."""
+        self.sem_embed = nn.Embedding(num_semantics + 1, dim)
+        nn.init.zeros_(self.sem_embed.weight)
+        self.anchor_embed = nn.Sequential(nn.Linear(2, 64), nn.GELU(), nn.Linear(64, dim))
+        nn.init.zeros_(self.anchor_embed[2].weight)
+        nn.init.zeros_(self.anchor_embed[2].bias)
+        self.free_id = num_semantics
+        self.anchor_scale = anchor_scale
+
+    def forward(self, mode, encoding, mask=None, slot_sem=None, slot_anchor=None):
         # Dynamic state consistency
         for blk in self.cross_block_time:
             mode = blk(mode, encoding, key_padding_mask=mask)
@@ -194,6 +206,10 @@ class TimeDecoder(nn.Module):
         multi_modal_query = self.multi_modal_query_embedding(self.modal)
         mode_query = encoding[:, 0]
         mode = mode_query[:, None] + multi_modal_query
+        if slot_sem is not None and hasattr(self, 'sem_embed'):
+            has_anchor = (slot_sem != self.free_id).unsqueeze(-1).to(mode.dtype)
+            mode = mode + self.sem_embed(slot_sem) \
+                + has_anchor * self.anchor_embed(slot_anchor / self.anchor_scale)
 
         for blk in self.cross_block_mode:
             mode = blk(mode, encoding, key_padding_mask=mask)

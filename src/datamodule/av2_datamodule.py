@@ -1,7 +1,8 @@
 from pathlib import Path
 from typing import Optional
 from pytorch_lightning import LightningDataModule
-from torch.utils.data import DataLoader as TorchDataLoader
+import torch
+from torch.utils.data import DataLoader as TorchDataLoader, WeightedRandomSampler
 from .av2_dataset import Av2Dataset, collate_fn
 
 
@@ -17,6 +18,7 @@ class Av2DataModule(LightningDataModule):
         num_workers: int = 8,
         pin_memory: bool = True,
         test: bool = False,
+        oversample: dict = None,
     ):
         super(Av2DataModule, self).__init__()
         self.data_root = Path(data_root)
@@ -28,6 +30,8 @@ class Av2DataModule(LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.test = test
+        # {label id: factor}, e.g. {3: 5, 4: 5} draws lane changes 5x as often
+        self.oversample = {int(k): float(v) for k, v in (oversample or {}).items()}
 
     def setup(self, stage: Optional[str] = None) -> None:
         if not self.test:
@@ -43,10 +47,16 @@ class Av2DataModule(LightningDataModule):
             )
 
     def train_dataloader(self):
+        sampler = None
+        if self.oversample:
+            w = torch.tensor([self.oversample.get(l, 1.0) for l in self.train_dataset.labels()],
+                             dtype=torch.double)
+            sampler = WeightedRandomSampler(w, num_samples=len(w), replacement=True)
         return TorchDataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            shuffle=self.shuffle,
+            shuffle=self.shuffle and sampler is None,
+            sampler=sampler,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             collate_fn=collate_fn,

@@ -59,21 +59,30 @@ def extract(args):
     from src.model.model_forecast import ModelForecast
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    # what the checkpoint holds: intention heads? semantic slots?
+    keys = torch.load(args.ckpt, map_location="cpu", weights_only=False)["state_dict"].keys()
+    has_heads = any("intention_head" in k for k in keys)
+    has_slots = any("sem_embed" in k for k in keys)
+    if has_slots and not args.slot_dir:
+        raise SystemExit("this checkpoint uses semantic slots: pass --slot_dir")
+    print(f"checkpoint: intention heads {has_heads}, semantic slots {has_slots}")
     net = ModelForecast(embed_dim=128, future_steps=60, num_heads=8, mlp_ratio=4.0,
-                        qkv_bias=False, drop_path=0.2, num_intentions=C)
+                        qkv_bias=False, drop_path=0.2, num_intentions=C if has_heads else 0,
+                        semantic_slots=has_slots)
     res = net.load_from_checkpoint(args.ckpt)
     if res.missing_keys:
         raise SystemExit(f"checkpoint is missing {len(res.missing_keys)} weights")
     net.to(dev).eval()
 
-    ds = Av2Dataset(data_root=args.data_root, split=args.split, intention_dir=args.intention_dir)
+    ds = Av2Dataset(data_root=args.data_root, split=args.split, intention_dir=args.intention_dir,
+                    slot_dir=args.slot_dir if has_slots else None)
     dl = DataLoader(ds, batch_size=args.batch_size, collate_fn=collate_fn, num_workers=2)
     types = {}
     with open(Path(args.intention_dir) / f"{args.split}.csv") as f:
         for r in csv.DictReader(f):
             types[r["scenario_id"]] = r["object_type"]
 
-    sids, labels, pis, heads, jobs, fdes, ades = [], [], [], [], [], [], []
+    sids, labels, pis, heads, jobs, fdes, ades, slots = [], [], [], [], [], [], [], []
     from tqdm.auto import tqdm
     with torch.no_grad():
         for batch in tqdm(dl, desc="DeMo"):
@@ -87,7 +96,8 @@ def extract(args):
                                torch.stack([th.sin(), th.cos()], -1)], -2)            # [B, 2, 2]
             world = (y.double() @ rot[:, None].transpose(-1, -2)
                      + data["origin"].double()[:, None, None]).cpu().numpy()          # [B, K, 60, 2]
-            hp = out["intent_logits"].softmax(-1).cpu().numpy()
+            hp = (out["intent_logits"].softmax(-1).cpu().numpy() if "intent_logits" in out
+                  else np.zeros((y.shape[0], C), dtype=np.float32))
             gt = data["target"][:, 0]                                                   # [B, 60, 2], agent frame
             fde = (y[:, :, -1] - gt[:, None, -1]).norm(dim=-1).cpu().numpy()           # [B, K]
             ade = (y - gt[:, None]).norm(dim=-1).mean(-1).cpu().numpy()                # [B, K]
@@ -98,6 +108,8 @@ def extract(args):
                 sids.append(sid); labels.append(lab)
                 pis.append(pi[i].cpu().numpy()); heads.append(hp[i])
                 fdes.append(fde[i]); ades.append(ade[i])
+                slots.append(data["slot_sem"][i].cpu().numpy() if "slot_sem" in data
+                             else np.full(fde.shape[1], -1))
                 jobs.append((sid, args.raw_root, args.split, data["origin"][i].double().cpu().numpy(),
                              float(data["theta"][i]), world[i], types.get(sid, "vehicle")))
 
@@ -109,6 +121,7 @@ def extract(args):
         rule=np.array([[p[0] for p in pp] for pp in per_path], dtype=np.int64),
         geom=np.array([[p[1:] for p in pp] for pp in per_path], dtype=np.float32),
         fde=np.array(fdes, dtype=np.float32), ade=np.array(ades, dtype=np.float32),
+        slot_sem=np.array(slots, dtype=np.int64),
         otype=np.array([types.get(s, "vehicle") for s in sids]))
     print(f"saved {len(sids)} scenarios to {args.out}")
 
@@ -235,6 +248,21 @@ def diagnose(args):
         d = np.bincount(rule[sel, k], minlength=C) / max(int(sel.sum()), 1)
         print(f"#{k:<5d}" + "".join(f"{v:7.1%}" for v in d) + f"{d.max():8.1%}{(top[sel] == k).mean():8.1%}")
 
+    if "slot_sem" in z and (z["slot_sem"] >= 0).any():
+        sem_names = ["STRAIGHT", "LEFT_TURN", "RIGHT_TURN", "LANE_CHANGE_L", "LANE_CHANGE_R", "STOP"]
+        sem_label = [CLASSES.index(n) for n in sem_names]
+        ss = z["slot_sem"]
+        print("\n3. Semantic slots: does the query given a maneuver produce that maneuver?")
+        print(f"{'slot meaning':14s} {'used in':>8s} {'path is it':>10s} {'is top':>7s}")
+        for j, n in enumerate(sem_names):
+            m = ss == j                                            # [N, 6]
+            if not m.any():
+                continue
+            ok = (rule == sem_label[j])[m].mean()
+            print(f"{n:14s} {m.any(1).mean():8.1%} {ok:10.1%} {(m[ar, top]).sum() / n_all:7.1%}")
+        print("  used in = share of scenarios where some query got this meaning (lane graph allows it)")
+        print("  path is it = share of those queries whose path the label rules call that maneuver")
+
     out = args.val.replace(".npz", "_diagnosis.csv")
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
@@ -252,6 +280,8 @@ def main():
     e.add_argument("--intention_dir", required=True, help="folder with <split>.csv labels")
     e.add_argument("--split", default="val", choices=["train", "val"])
     e.add_argument("--out", required=True)
+    e.add_argument("--slot_dir", default=None, help="folder with <split>.csv from semantic_slots.py "
+                   "(needed for a checkpoint trained with semantic slots)")
     e.add_argument("--batch_size", type=int, default=32)
     e.add_argument("--workers", type=int, default=os.cpu_count())
     f = sub.add_parser("fit")

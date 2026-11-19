@@ -25,9 +25,11 @@ class ModelForecast(nn.Module):
         drop_path=0.2,
         future_steps: int = 60,
         num_intentions: int = 0,
+        semantic_slots: bool = False,
     ) -> None:
         super().__init__()
         self.num_intentions = num_intentions
+        self.semantic_slots = semantic_slots
 
         self.hist_embed_mlp = nn.Sequential(
             nn.Linear(4, 64),
@@ -96,6 +98,10 @@ class ModelForecast(nn.Module):
             )
 
         self.initialize_weights()
+        if semantic_slots:
+            # added after the weight init: they start at zero, so the model
+            # starts exactly as the released DeMo
+            self.time_decoder.enable_semantic_slots(embed_dim)
 
     def initialize_weights(self):
         nn.init.normal_(self.actor_type_embed, std=0.02)
@@ -239,7 +245,9 @@ class ModelForecast(nn.Module):
 
         # decoder module with decoupled queries
         dense_predict, y_hat, pi, x_mode, new_y_hat, new_pi, mode_dense, scal, scal_new = \
-        self.time_decoder(mode, x_encoder, mask=~key_valid_mask)
+        self.time_decoder(mode, x_encoder, mask=~key_valid_mask,
+                          slot_sem=data.get("slot_sem") if self.semantic_slots else None,
+                          slot_anchor=data.get("slot_anchor") if self.semantic_slots else None)
 
         if isinstance(self, StreamModelForecast) and self.use_stream_decoder:
             cos, sin = data["theta"].cos(), data["theta"].sin()
