@@ -24,7 +24,7 @@ intention_dir: data/intention_labels
 intention_weight: 0.5
 intention_class_weights:
 freeze_backbone: false  # true = train only the intention heads (same as train_scope: heads)
-train_scope: all        # all | heads | decoder (encoders frozen, decoder + semantic slots trained)
+train_scope: all        # all | heads | decoder (encoders frozen) | modes (only the mode-query branch + slots)
 # semantic mode slots (scene-conditioned allocation), files from semantic_slots.py
 semantic_slots: false
 slot_dir:

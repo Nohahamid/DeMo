@@ -32,7 +32,7 @@ class Trainer(pl.LightningModule):
         semantic_weight: float = 1.0,
     ) -> None:
         super(Trainer, self).__init__()
-        assert train_scope in ('all', 'heads', 'decoder')
+        assert train_scope in ('all', 'heads', 'decoder', 'modes')
         if freeze_backbone:
             train_scope = 'heads'
         self.train_scope = train_scope
@@ -58,7 +58,15 @@ class Trainer(pl.LightningModule):
             # 'heads': only the intention heads, DeMo's trajectories stay exactly as released
             # 'decoder': DeMo's encoders stay frozen; the decoder (with the semantic
             #            slots) and the intention heads are trained
-            keep = ('intention_head',) if train_scope == 'heads' else ('intention_head', 'time_decoder.')
+            # 'modes': only the mode-query branch (+ semantic slots); the state queries
+            #          and the hybrid refinement stay as released (least forgetting)
+            keep = {
+                'heads': ('intention_head',),
+                'decoder': ('intention_head', 'time_decoder.'),
+                'modes': ('intention_head', 'time_decoder.sem_embed', 'time_decoder.anchor_embed',
+                          'time_decoder.multi_modal_query_embedding', 'time_decoder.cross_block_mode',
+                          'time_decoder.self_block_mode', 'time_decoder.predictor.'),
+            }[train_scope]
             for n, p in self.net.named_parameters():
                 p.requires_grad = any(k in n for k in keep)
             n_train = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
@@ -224,7 +232,7 @@ class Trainer(pl.LightningModule):
             data = data[-1]
         if self.train_scope == 'heads':
             self.net.eval()  # no drop-path noise in the frozen backbone
-        elif self.train_scope == 'decoder':
+        elif self.train_scope in ('decoder', 'modes'):
             self.net.eval()
             self.net.time_decoder.train()
         out = self(data)
