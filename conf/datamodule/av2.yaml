@@ -11,8 +11,11 @@ target:
   shuffle: True
   num_workers: ${num_workers}
   pin_memory: True
+  oversample: ${oversample}
   dataset:
     num_historical_steps: 50
     sequence_origins: [50]
     radius: 150.0
     train_mode: 'only_focal'
+    intention_dir: ${intention_dir}
+    slot_dir: ${slot_dir}

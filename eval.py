@@ -30,10 +30,14 @@ def main(conf):
     if trainer.local_rank == 0:
         with open(os.path.join(HydraConfig.get().runtime.output_dir, "model.log"), "x") as f:
             print(model.net, file=f)
+    # PyTorch >= 2.6 loads checkpoints with weights_only=True, which rejects the
+    # Hydra config stored in DeMo's released checkpoint (trusted file).
+    import inspect
+    kw = {"weights_only": False} if "weights_only" in inspect.signature(trainer.validate).parameters else {}
     if not conf.test:
-        trainer.validate(model, datamodule, ckpt_path=checkpoint)
+        trainer.validate(model, datamodule, ckpt_path=checkpoint, **kw)
     else:
-        trainer.test(model, datamodule, ckpt_path=checkpoint)
+        trainer.test(model, datamodule, ckpt_path=checkpoint, **kw)
 
 
 if __name__ == "__main__":

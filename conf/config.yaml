@@ -17,6 +17,19 @@ save_top_k: 10
 data_root:
 checkpoint:
 pretrained_weights:
+
+# named intentions (0 = original DeMo)
+num_intentions: 0
+intention_dir: data/intention_labels
+intention_weight: 0.5
+intention_class_weights:
+freeze_backbone: false  # true = train only the intention heads (same as train_scope: heads)
+train_scope: all        # all | heads | decoder (encoders frozen) | modes (only the mode-query branch + slots)
+# semantic mode slots (scene-conditioned allocation), files from semantic_slots.py
+semantic_slots: false
+slot_dir:
+semantic_weight: 1.0
+oversample:             # e.g. {3: 5, 4: 5} = lane changes drawn 5x as often
 output: change_${datamodule.name}_${datamodule.phase}_${model.name}_${model.phase}
 
 # trainer

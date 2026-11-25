@@ -1,9 +1,17 @@
+import csv
 from typing import List
 from pathlib import Path
 import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
+
+# semantic mode slots (see semantic_slots.py); label ids from intention_labels.CLASSES
+SEMANTICS = ['STRAIGHT', 'LEFT_TURN', 'RIGHT_TURN', 'LANE_CHANGE_L', 'LANE_CHANGE_R', 'STOP']
+LABEL_TO_SEM = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 6: 5}
+PRIORITY = [0, 3, 4, 1, 2, 5]   # straight, lane changes, turns, stop
+FREE = len(SEMANTICS)           # a query with no assigned meaning
+NUM_MODES = 6
 
 
 class Av2Dataset(Dataset):
@@ -15,7 +23,8 @@ class Av2Dataset(Dataset):
         sequence_origins: List[int] = [50],
         radius: float = 150.0,
         train_mode: str = 'only_focal',
-
+        intention_dir: str = None,
+        slot_dir: str = None,
     ):
         assert sequence_origins[-1] == 50 and num_historical_steps <= 50
         assert train_mode in ['only_focal', 'focal_and_scored']
@@ -30,9 +39,34 @@ class Av2Dataset(Dataset):
         self.mode = 'only_focal' if split != 'train' else train_mode
         self.radius = radius
 
+        # scenario_id -> intention class, made by intention_labels.py
+        self.intentions = {}
+        label_file = Path(intention_dir) / f'{split}.csv' if intention_dir else None
+        if label_file is not None and label_file.exists():
+            with open(label_file) as f:
+                self.intentions = {r['scenario_id']: int(r['label']) for r in csv.DictReader(f)}
+            print(f'intention labels: {len(self.intentions)} from {label_file}')
+
+        # scenario_id -> (feasible [6], anchors [6, 2] map frame), made by semantic_slots.py
+        self.slots = {}
+        slot_file = Path(slot_dir) / f'{split}.csv' if slot_dir else None
+        if slot_file is not None and slot_file.exists():
+            with open(slot_file) as f:
+                for r in csv.DictReader(f):
+                    feas = [int(r[f'feas_{n}']) for n in SEMANTICS]
+                    anc = [[float(r[f'ax_{n}']), float(r[f'ay_{n}'])] for n in SEMANTICS]
+                    self.slots[r['scenario_id']] = (feas, anc)
+            print(f'semantic slots: {len(self.slots)} from {slot_file}')
+        elif slot_dir:
+            raise FileNotFoundError(f'no slot file {slot_file}')
+
         print(
             f'data root: {data_root}/{split}, total number of files: {len(self.file_list)}'
         )
+
+    def labels(self):
+        """Intention label per file (for oversampling), -100 if unknown."""
+        return [self.intentions.get(f.stem[len('scenario_'):], -100) for f in self.file_list]
 
     def __len__(self) -> int:
         return len(self.file_list)
@@ -53,9 +87,38 @@ class Av2Dataset(Dataset):
         for cur_step in self.sequence_origins:
             for ag_idx in train_idx:
                 ag_dict = self.process_single_agent(data, ag_idx, cur_step)
+                label = -100  # ignored by the loss
+                if ag_idx == data['focal_idx']:
+                    label = self.intentions.get(data['scenario_id'], -100)
+                ag_dict['intention'] = torch.tensor(label, dtype=torch.long)
+                self.add_slots(ag_dict, data['scenario_id'] if ag_idx == data['focal_idx'] else None, label)
             sequence_data.append(ag_dict)
         
         return sequence_data
+
+    def add_slots(self, ag_dict, scenario_id, label):
+        """Scene-conditioned semantic allocation of the 6 mode queries.
+
+        One query per feasible maneuver, in PRIORITY order; the rest stay FREE
+        (plain DeMo queries). slot_target = the query of the true maneuver, or -1."""
+        sem = [FREE] * NUM_MODES
+        anchor = torch.zeros(NUM_MODES, 2)
+        target = -1
+        if scenario_id in self.slots:
+            feas, anc = self.slots[scenario_id]
+            chosen = [j for j in PRIORITY if feas[j]][:NUM_MODES]
+            origin, theta = ag_dict['origin'].view(2), ag_dict['theta'].view(())
+            rot = torch.tensor([[torch.cos(theta), -torch.sin(theta)],
+                                [torch.sin(theta), torch.cos(theta)]])
+            for k, j in enumerate(chosen):
+                sem[k] = j
+                anchor[k] = torch.matmul(torch.tensor(anc[j], dtype=torch.float64) - origin, rot).float()
+            j_true = LABEL_TO_SEM.get(int(label), -1)
+            if j_true in chosen:
+                target = chosen.index(j_true)
+        ag_dict['slot_sem'] = torch.tensor(sem, dtype=torch.long)
+        ag_dict['slot_anchor'] = anchor
+        ag_dict['slot_target'] = torch.tensor(target, dtype=torch.long)
 
     def process_single_agent(self, data, idx, step=50):
         # info for cur_agent on cur_step
@@ -257,6 +320,12 @@ def collate_fn(seq_batch):
 
         data['x_key_valid_mask'] = data['x_valid_mask'].any(-1)
         data['lane_key_valid_mask'] = data['lane_valid_mask'].any(-1)
+
+        if 'intention' in batch[0]:
+            data['intention'] = torch.stack([b['intention'] for b in batch])
+        for key in ['slot_sem', 'slot_anchor', 'slot_target']:
+            if key in batch[0]:
+                data[key] = torch.stack([b[key] for b in batch])
 
         data['scenario_id'] = [b['scenario_id'] for b in batch]
         data['track_id'] = [b['track_id'] for b in batch]
